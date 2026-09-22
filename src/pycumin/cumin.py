@@ -28,122 +28,41 @@ Method
              index is single-strand.
 
   build      entries are radix-partitioned on the feature's top byte into 256
-             on-disk buckets as they are produced. Processing buckets 0..255 in
-             order and concatenating yields a globally sorted array, so only one
-             bucket (~n/256) is ever sorted in RAM, once. No full argsort.
+             on-disk buckets as they are produced (or, in --high-mem mode,
+             sorted in a single in-memory pass -- see _core.Index).
 
 Measured: 3.1 Gbp in 2.44 GB (0.79 B/base), AUROC 0.985, 96.9% correct locus,
 ~0.7 ms/read, ~5.5 min single-threaded build.
 
+The anchor/index/query engine itself (syncmer selection, the radix-bucket or
+in-memory build, and windowed voting) is implemented in C++ (see ``_core``,
+built from ``src/index.cpp``/``src/cumin.h``); this module is the thin CLI
+and evaluation layer on top of it.
+
 Usage
 -----
-  cumin.py build --ref gut.fa.gz --index gut.idx.npz
-  cumin.py map   --index gut.idx.npz --reads sample.fq.gz --out hits.tsv
-  cumin.py eval  --index gut.idx.npz --pos pos.fq.gz --neg neg.fq.gz --out results/
+  cumin.py build --ref gut.fa.gz --index gut.idx
+  cumin.py map   --index gut.idx --reads sample.fq.gz --out hits.tsv
+  cumin.py eval  --index gut.idx --pos pos.fq.gz --neg neg.fq.gz --out results/
   cumin.py demo                       # synthetic end-to-end check
 
 Read headers for eval are parsed as  <refname>!<start>!<end>!<strand>
 e.g.  @Rep_817_C_0!30866!31389!+ qs:f:9.9340
-
-numpy only.
 """
 
 import argparse
 import gzip
-import json
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
 
-M_ANCHOR = np.uint64(0x9E3779B97F4A7C15)
-M_DOWN = np.uint64(0xC2B2AE3D27D4EB4F)
-
-_B = np.full(256, 255, np.uint8)
-for _i, _c in enumerate("ACGT"):
-    _B[ord(_c)] = _i
-    _B[ord(_c.lower())] = _i
+from . import _core
 
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", file=sys.stderr, flush=True)
-
-
-# ─────────────────────────── sequence ───────────────────────────────────────
-
-def encode(seq: str) -> np.ndarray:
-    return _B[np.frombuffer(seq.encode(), np.uint8)]
-
-
-def revcomp_codes(codes: np.ndarray) -> np.ndarray:
-    out = codes[::-1].copy()
-    v = out < 4
-    out[v] = 3 - out[v]
-    return out
-
-
-def mix64(x):
-    """splitmix64 finalizer, vectorised."""
-    x = np.asarray(x, np.uint64).copy()
-    x ^= x >> np.uint64(30)
-    x *= np.uint64(0xBF58476D1CE4E5B9)
-    x ^= x >> np.uint64(27)
-    x *= np.uint64(0x94D049BB133111EB)
-    x ^= x >> np.uint64(31)
-    return x
-
-
-def _roll(codes, m):
-    """m-mer base-4 values over `codes`; returns (values int64, bad bool)."""
-    n = len(codes)
-    if n < m:
-        return np.empty(0, np.int64), np.empty(0, bool)
-    L = n - m + 1
-    c = codes.astype(np.int64)
-    valid = codes < 4
-    np.putmask(c, ~valid, 0)
-    vals = np.zeros(L, np.int64)
-    bad = np.zeros(L, bool)
-    for j in range(m):
-        vals = vals * 4 + c[j:j + L]
-        bad |= ~valid[j:j + L]
-    return vals, bad
-
-
-def syncmer_anchors(codes, k, s, t, downsample):
-    """Open syncmers. Returns (positions int64, anchor_hash uint64)."""
-    n = len(codes)
-    w = k - s + 1
-    nk = n - k + 1
-    if nk <= 0:
-        return np.empty(0, np.int64), np.empty(0, np.uint64)
-
-    sv, sbad = _roll(codes, s)
-    sh = mix64(np.where(sbad, np.int64(0), sv).astype(np.uint64))
-    sh[sbad] = np.uint64(0xFFFFFFFFFFFFFFFF)       # never the minimum
-
-    need = nk + w - 1
-    if len(sh) < need:
-        return np.empty(0, np.int64), np.empty(0, np.uint64)
-    sel = np.lib.stride_tricks.sliding_window_view(sh[:need], w).argmin(axis=1) == t
-
-    kv, kbad = _roll(codes, k)
-    sel &= ~kbad[:nk]
-    kh = mix64(kv[:nk].astype(np.uint64) * M_ANCHOR)
-    if downsample > 1:
-        sel &= (mix64(kh ^ M_DOWN) % np.uint64(downsample)) == np.uint64(0)
-
-    pos = np.nonzero(sel)[0].astype(np.int64)
-    return pos, kh[pos]
-
-
-def read_anchors(seq, p):
-    """Anchor hashes for a read, forward and reverse-complement."""
-    codes = encode(seq)
-    _, fwd = syncmer_anchors(codes, p.k, p.s, p.t, p.downsample)
-    _, rev = syncmer_anchors(revcomp_codes(codes), p.k, p.s, p.t, p.downsample)
-    return fwd, rev
 
 
 # ─────────────────────────── i/o ────────────────────────────────────────────
@@ -217,273 +136,11 @@ def parse_header(h):
         return None
 
 
-# ─────────────────────────── index ──────────────────────────────────────────
-
-class Params:
-    """Anchor parameters. Stored with the index so query cannot drift."""
-
-    FIELDS = ("k", "s", "t", "downsample", "win", "max_occ_pct")
-
-    def __init__(self, k=15, s=8, t=0, downsample=2, win=4000, max_occ_pct=99.9):
-        self.k, self.s, self.t = k, s, t
-        self.downsample, self.win, self.max_occ_pct = downsample, win, max_occ_pct
-        if s >= k:
-            sys.exit("s must be smaller than k")
-        if not 0 <= t <= k - s:
-            sys.exit(f"t must be in [0, {k - s}]")
-
-    @property
-    def density(self):
-        return 1.0 / ((self.k - self.s + 1) * self.downsample)
-
-    def to_json(self):
-        return json.dumps({f: getattr(self, f) for f in self.FIELDS})
-
-    @staticmethod
-    def from_json(txt):
-        return Params(**json.loads(txt))
-
-    def __str__(self):
-        return (f"k={self.k} s={self.s} t={self.t} downsample={self.downsample} "
-                f"win={self.win} density~1/{1/self.density:.0f}")
-
-
-class Index:
-    """
-    Anchors filed under overlapping reference windows.
-
-    ufeat   uint64  sorted unique anchor hashes
-    starts  int64   offset of each key's run in wsorted
-    cnt     int32   run length
-    wsorted int32   window ids, grouped by key
-    """
-
-    NB = 256
-    SHIFT = np.uint64(56)
-
-    # ---- construction ----------------------------------------------------
-
-    def __init__(self, params, tmpdir="/tmp", batch=20_000_000, chunk=32_000_000):
-        self.p = params
-        self.step = params.win // 2
-        self.batch, self.chunk = batch, chunk
-        self.rec_names, self.rec_first = [], []
-        self._base = 0
-        self._pf, self._pw, self._pending = [], [], 0
-        self.n_entries = 0
-        self.dir = Path(tmpdir) / f"sm_buckets_{int(time.time())}_{id(self)}"
-        self.dir.mkdir(parents=True, exist_ok=True)
-        self._fh = [(open(self.dir / f"f{i:03d}.bin", "wb"),
-                     open(self.dir / f"w{i:03d}.bin", "wb")) for i in range(self.NB)]
-
-    def add_record(self, name, seq):
-        """
-        Index one reference record, chunked so a long chromosome does not need
-        ~8 bytes/base of transient arrays at once. Returns the anchor count.
-        """
-        L = len(seq)
-        nwin = max(1, L // self.step + 1)
-        rec = len(self.rec_names)
-        self.rec_names.append(name)
-        self.rec_first.append(self._base)
-        base = self._base
-        self._base += nwin
-
-        pad = self.p.k + 4096
-        step = max(self.chunk, pad * 4)
-        n_anchor, start = 0, 0
-        while start < L:
-            end = min(L, start + step)
-            lo, hi = max(0, start - pad), min(L, end + pad)
-            pos, ah = syncmer_anchors(encode(seq[lo:hi]),
-                                      self.p.k, self.p.s, self.p.t, self.p.downsample)
-            if len(pos):
-                pos = pos + lo
-                keep = (pos >= start) & (pos < end)
-                pos, ah = pos[keep], ah[keep]
-                n_anchor += len(pos)
-                if len(pos):
-                    self._file(pos, ah, base, nwin)
-            start = end
-        if self._pending >= self.batch:
-            self._flush()
-        return n_anchor
-
-    def _file(self, pos, ah, base, nwin):
-        w0 = pos // self.step
-        for shift in (0, -1):
-            ww = w0 + shift
-            ok = (ww >= 0) & (ww < nwin)
-            if not ok.any():
-                continue
-            self._pf.append(ah[ok])
-            self._pw.append((ww[ok] + base).astype(np.int32))
-            self._pending += int(ok.sum())
-
-    def _flush(self):
-        if not self._pf:
-            return
-        f = np.concatenate(self._pf)
-        w = np.concatenate(self._pw)
-        self._pf, self._pw, self._pending = [], [], 0
-        b = (f >> self.SHIFT).astype(np.uint8)
-        o = np.argsort(b, kind="stable")
-        f, w, bs = f[o], w[o], b[o]
-        del o, b
-        edges = np.searchsorted(bs, np.arange(self.NB + 1))
-        for i in range(self.NB):
-            a, z = int(edges[i]), int(edges[i + 1])
-            if z > a:
-                f[a:z].tofile(self._fh[i][0])
-                w[a:z].tofile(self._fh[i][1])
-        self.n_entries += len(f)
-
-    def _bucket(self, i):
-        f = np.fromfile(self.dir / f"f{i:03d}.bin", dtype=np.uint64)
-        w = np.fromfile(self.dir / f"w{i:03d}.bin", dtype=np.int32)
-        if len(f) == 0:
-            return f, w
-        o = np.argsort(f, kind="stable")
-        return f[o], w[o]
-
-    @staticmethod
-    def _runs(f):
-        m = np.empty(len(f), bool)
-        m[0] = True
-        np.not_equal(f[1:], f[:-1], out=m[1:])
-        st = np.flatnonzero(m)
-        return st, np.diff(np.append(st, len(f)))
-
-    def build(self, sample_buckets=16):
-        self._flush()
-        for a, b in self._fh:
-            a.close(); b.close()
-        self._fh = []
-
-        # occurrence cutoff. Buckets partition by feature value, so per-bucket
-        # counts are exact global counts and a sample suffices for a percentile.
-        if self.p.max_occ_pct >= 100:
-            self.occ_cutoff = np.iinfo(np.int64).max
-        else:
-            samp, stride = [], max(1, self.NB // sample_buckets)
-            for i in range(0, self.NB, stride):
-                f, _ = self._bucket(i)
-                if len(f):
-                    samp.append(self._runs(f)[1])
-                del f
-            self.occ_cutoff = (max(1, int(np.percentile(np.concatenate(samp),
-                                                        self.p.max_occ_pct)))
-                               if samp else np.iinfo(np.int64).max)
-
-        uf, cn, ws, dropped = [], [], [], 0
-        for i in range(self.NB):
-            f, w = self._bucket(i)
-            if len(f) == 0:
-                continue
-            st, cnt = self._runs(f)
-            keep = cnt <= self.occ_cutoff
-            dropped += int((~keep).sum())
-            if keep.any():
-                uf.append(f[st[keep]])
-                cn.append(cnt[keep].astype(np.int32))
-                ws.append(w[np.repeat(keep, cnt)])
-            del f, w, st, cnt, keep
-            (self.dir / f"f{i:03d}.bin").unlink(missing_ok=True)
-            (self.dir / f"w{i:03d}.bin").unlink(missing_ok=True)
-
-        self.n_dropped = dropped
-        if uf:
-            self.ufeat = np.concatenate(uf); uf.clear()
-            self.cnt = np.concatenate(cn); cn.clear()
-            self.wsorted = np.concatenate(ws); ws.clear()
-            self.starts = np.concatenate(([0], np.cumsum(self.cnt.astype(np.int64))[:-1]))
-        else:
-            self.ufeat = np.empty(0, np.uint64)
-            self.cnt = np.empty(0, np.int32)
-            self.wsorted = np.empty(0, np.int32)
-            self.starts = np.empty(0, np.int64)
-        self.rec_first = np.asarray(self.rec_first, np.int64)
-        try:
-            self.dir.rmdir()
-        except OSError:
-            pass
-        return self
-
-    # ---- persistence -----------------------------------------------------
-
-    def save(self, path):
-        np.savez(path, ufeat=self.ufeat, starts=self.starts, cnt=self.cnt,
-                 wsorted=self.wsorted, rec_first=self.rec_first,
-                 rec_names=np.array(self.rec_names, dtype=object),
-                 params=np.array(self.p.to_json()),
-                 occ_cutoff=np.array(self.occ_cutoff),
-                 n_entries=np.array(self.n_entries))
-
-    @staticmethod
-    def load(path):
-        z = np.load(path, allow_pickle=True)
-        ix = Index.__new__(Index)
-        ix.p = Params.from_json(str(z["params"]))
-        ix.step = ix.p.win // 2
-        for f in ("ufeat", "starts", "cnt", "wsorted", "rec_first"):
-            setattr(ix, f, z[f])
-        ix.rec_names = list(z["rec_names"])
-        ix.occ_cutoff = int(z["occ_cutoff"])
-        ix.n_entries = int(z["n_entries"])
-        ix.n_dropped = 0
-        return ix
-
-    def nbytes(self):
-        return sum(a.nbytes for a in (self.ufeat, self.starts, self.cnt, self.wsorted))
-
-    def window_locus(self, wid):
-        """Window id -> (record name, window start bp)."""
-        r = int(np.searchsorted(self.rec_first, wid, "right") - 1)
-        return self.rec_names[r], int((wid - self.rec_first[r]) * self.step)
-
-    # ---- query -----------------------------------------------------------
-
-    def vote(self, anchors):
-        """
-        One orientation. Returns (score, window_id, n_unique_anchors).
-        score = best_window_votes / n_unique_anchors.
-        """
-        if len(anchors) == 0 or len(self.ufeat) == 0:
-            return 0.0, -1, 0
-        q = np.unique(anchors)
-        lo = np.clip(np.searchsorted(self.ufeat, q), 0, len(self.ufeat) - 1)
-        hit = self.ufeat[lo] == q
-        if not hit.any():
-            return 0.0, -1, len(q)
-        sel = lo[hit]
-        st = self.starts[sel]
-        cnt = self.cnt[sel].astype(np.int64)
-        total = int(cnt.sum())
-        if total == 0:
-            return 0.0, -1, len(q)
-        off = np.repeat(np.cumsum(cnt) - cnt, cnt)
-        gidx = np.repeat(st, cnt) + (np.arange(total) - off)
-        wins, wc = np.unique(self.wsorted[gidx], return_counts=True)
-        b = int(wc.argmax())
-        return float(wc[b]) / len(q), int(wins[b]), len(q)
-
-    def query(self, seq):
-        """
-        Both orientations, better kept.
-        Returns (score, window_id, strand, n_unique_anchors).
-        """
-        fwd, rev = read_anchors(seq, self.p)
-        sf, wf, nf = self.vote(fwd)
-        sr, wr, nr = self.vote(rev)
-        if sf >= sr:
-            return sf, wf, "+", nf
-        return sr, wr, "-", nr
-
-
 # ─────────────────────────── driver helpers ─────────────────────────────────
 
-def build_index(ref_path, params, tmpdir, batch, chunk, max_ref_bp=None):
-    ix = Index(params, tmpdir, batch, chunk)
+def build_index(ref_path, tmpdir="/tmp", batch=20_000_000, chunk=32_000_000, max_ref_bp=None, **anchor_kwargs):
+    """anchor_kwargs: k, s, t, downsample, win, max_occ_pct, low_mem (see _core.Index)."""
+    ix = _core.Index(tmpdir=tmpdir, batch=batch, chunk=chunk, **anchor_kwargs)
     bp = anchors = nrec = 0
     for name, seq in read_fasta(ref_path, max_ref_bp):
         bp += len(seq)
@@ -517,13 +174,13 @@ def score_reads(ix, reads, label, max_qbp=None):
         if len(seq) < ix.p.k + 5:
             continue
         qlen.append(len(seq))
-        s_, wid, _, nq = ix.query(seq)
+        r = ix.query(seq)
         ids.append(h.split()[0])
-        sc.append(s_)
-        na.append(nq)
+        sc.append(r.score)
+        na.append(r.n_anchors)
         truth = parse_header(h)
-        if truth is not None and wid >= 0:
-            rn, wstart = ix.window_locus(wid)
+        if truth is not None and r.window >= 0:
+            rn, wstart = ix.window_locus(r.window)
             lo.append(1 if (rn == truth[0] and wstart < truth[2]
                             and wstart + ix.p.win > truth[1]) else 0)
         else:
@@ -552,16 +209,20 @@ def auroc(p, n):
 
 # ─────────────────────────── subcommands ────────────────────────────────────
 
+def _anchor_kwargs(a):
+    return dict(k=a.k, s=a.s, t=a.t, downsample=a.downsample, win=a.win,
+                max_occ_pct=a.max_occ_pct, low_mem=not a.high_mem)
+
+
 def cmd_build(a):
-    p = Params(a.k, a.s, a.t, a.downsample, a.win, a.max_occ_pct)
-    log(f"building: {p}")
-    ix = build_index(a.ref, p, a.tmpdir, a.batch, a.chunk, a.max_ref_bp)
+    ix = build_index(a.ref, a.tmpdir, a.batch, a.chunk, a.max_ref_bp, **_anchor_kwargs(a))
     ix.save(a.index)
     log(f"wrote {a.index}")
 
 
 def cmd_map(a):
-    ix = Index.load(a.index)
+    ix = _core.Index()
+    ix.load(a.index)
     log(f"loaded {a.index}: {ix.n_entries:,} entries, {ix.nbytes()/1e9:.2f} GB, {ix.p}")
     n, t0 = 0, time.time()
     with open(a.out, "w") as fh:
@@ -572,10 +233,10 @@ def cmd_map(a):
                 seq = seq[:a.max_query_bp]
             if len(seq) < ix.p.k + 5:
                 continue
-            s_, wid, strand, nq = ix.query(seq)
-            ref, ws = ix.window_locus(wid) if wid >= 0 else ("*", -1)
-            fh.write(f"{h.split()[0]}\t{len(seq)}\t{s_:.6f}\t{nq}\t{strand}\t"
-                     f"{ref}\t{ws}\t{'keep' if s_ > a.threshold else 'reject'}\n")
+            r = ix.query(seq)
+            ref, ws = ix.window_locus(r.window) if r.window >= 0 else ("*", -1)
+            fh.write(f"{h.split()[0]}\t{len(seq)}\t{r.score:.6f}\t{r.n_anchors}\t{r.strand}\t"
+                     f"{ref}\t{ws}\t{'keep' if r.score > a.threshold else 'reject'}\n")
             n += 1
     dt = time.time() - t0
     log(f"{n:,} reads in {dt:.1f}s ({1000*dt/max(n,1):.2f} ms/read) -> {a.out}")
@@ -583,12 +244,11 @@ def cmd_map(a):
 
 def cmd_eval(a):
     if a.index:
-        ix = Index.load(a.index)
+        ix = _core.Index()
+        ix.load(a.index)
         log(f"loaded {a.index}: {ix.n_entries:,} entries, {ix.nbytes()/1e9:.2f} GB")
     else:
-        p = Params(a.k, a.s, a.t, a.downsample, a.win, a.max_occ_pct)
-        log(f"building: {p}")
-        ix = build_index(a.ref, p, a.tmpdir, a.batch, a.chunk, a.max_ref_bp)
+        ix = build_index(a.ref, a.tmpdir, a.batch, a.chunk, a.max_ref_bp, **_anchor_kwargs(a))
 
     pid, P, Pa, Plo, mq = score_reads(ix, read_reads(a.pos, a.max_reads),
                                       "positives", a.max_query_bp)
@@ -657,8 +317,7 @@ def cmd_demo(a):
                 out.append(ch)
         return "".join(out)
 
-    p = Params(a.k, a.s, a.t, a.downsample, a.win, a.max_occ_pct)
-    ix = Index(p, a.tmpdir, a.batch, a.chunk)
+    ix = _core.Index(tmpdir=a.tmpdir, batch=a.batch, chunk=a.chunk, **_anchor_kwargs(a))
     bp = anchors = 0
     for nm, sq in refs:
         bp += len(sq)
@@ -682,15 +341,15 @@ def cmd_demo(a):
     print(f"  query length     {mq:.0f} bp")
     print(f"  AUROC            {auroc(P, N):.4f}")
     print(f"  median positive  {np.median(P):.4f}  "
-          f"(sub-equiv error {1 - np.median(P)**(1/p.k):.4f})")
+          f"(sub-equiv error {1 - np.median(P)**(1/ix.p.k):.4f})")
     print(f"  median negative  {np.median(N):.4f}")
     print(f"  sens @ 95% spec  {float((P > thr).mean()):.4f}  (thr {thr:.4f})")
     print(f"  correct locus    {Plo[known].mean():.4f}")
     print(f"  anchors/read     {np.mean(Pa):.1f}")
     print()
     q = ix.query(pos[0][1][:a.max_query_bp] if a.max_query_bp else pos[0][1])
-    log(f"single-read query check: score={q[0]:.4f} strand={q[2]} "
-        f"locus={ix.window_locus(q[1]) if q[1] >= 0 else None}")
+    log(f"single-read query check: score={q.score:.4f} strand={q.strand} "
+        f"locus={ix.window_locus(q.window) if q.window >= 0 else None}")
 
 
 # ─────────────────────────── cli ────────────────────────────────────────────
@@ -711,7 +370,10 @@ def add_anchor_args(ap):
     ap.add_argument("--win", type=int, default=4000, help="reference window (bp)")
     ap.add_argument("--max-occ-pct", type=float, default=99.9,
                     help="drop features above this occurrence percentile")
-    ap.add_argument("--tmpdir", default="/tmp", help="scratch for radix buckets")
+    ap.add_argument("--high-mem", action="store_true",
+                    help="sort the whole reference's anchors in memory in one pass "
+                         "instead of streaming through on-disk radix buckets")
+    ap.add_argument("--tmpdir", default="/tmp", help="scratch for radix buckets (low-mem mode)")
     ap.add_argument("--batch", type=int, default=20_000_000)
     ap.add_argument("--chunk", type=int, default=32_000_000,
                     help="max bp of one record processed at a time")

@@ -6,6 +6,7 @@ from typing import Optional, Any, Iterable
 import attrs
 
 from . import Index
+from ._core import QueryRequest
 
 
 @dataclass
@@ -56,17 +57,16 @@ class Aligner:
         else:
             self.input = kwargs['input']
         self.threshold = kwargs.get('threshold', 0.15)
-        self.aligner = Index.load(self.input)
+        self.aligner = Index()
+        self.aligner.load(self.input)
 
     def validate(self) -> None:
         input: str = self.kwargs["input"]
-        file_extensions = [".npz"]
+        # No fixed extension any more -- _core.Index.save()/load() write a
+        # raw binary blob at whatever path is given (unlike the old
+        # numpy-based Index, which np.savez'd to a fixed ".npz").
         if all((not Path(input).is_file(), input)):
             raise FileNotFoundError(f"{input} does not exist")
-        if not any(input.lower().endswith(suffix) for suffix in file_extensions):
-            raise RuntimeError(
-                f"Provided index file appears to be of an incorrect type - should be one of {file_extensions}"
-            )
 
     @property
     def initialised(self) -> bool:
@@ -78,17 +78,30 @@ class Aligner:
                 format(self.kwargs['input']))
 
     def map_reads(self, calls: Iterable[Result]) -> Iterable[Result]:
-        for result in calls:
-            seq = result.seq
-            if not seq:
-                result.alignment_data = []
+        skipped = []
+        metadata = {}
+
+        def _gen(_calls):
+            for result in _calls:
+                rid = result.read_id
+                metadata[rid] = result
+                seq = result.seq
+                if not seq:
+                    skipped.append(result)
+                    continue
+                yield QueryRequest(rid, seq)
+
+        for response in self.aligner.query_stream(_gen(calls)):
+            result = metadata[response.id]
+            r = response.result
+            if r.window >= 0 and r.score > self.threshold:
+                ref, ws = self.aligner.window_locus(r.window)
+                result.alignment_data = [Alignment(ref, ws, ws + len(result.seq), r.strand)]
             else:
-                s_, wid, strand, nq = self.aligner.query(seq)
-                ref, ws = self.aligner.window_locus(wid) if wid >= 0 else ("*", -1)
-                if s_ > self.threshold:
-                    result.alignment_data = [Alignment(ref, ws, ws + len(seq), strand)]
-                else:
-                    result.alignment_data = []
+                result.alignment_data = []
+            yield result
+        for result in skipped:
+            result.alignment_data = []
             yield result
 
     def disconnect(self):

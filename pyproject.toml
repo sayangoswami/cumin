@@ -1,17 +1,17 @@
 [build-system]
-requires = ["setuptools>=61.0"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core", "pybind11"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "pycumin"
-version = "0.1.0.dev1"
+version = "0.1.0.dev3"
 description = "Containment-based Unordered Mapping Index for Nanopore"
 authors = [
     { name="Sayan Goswami", email="sgoswami@smcm.edu" }
 ]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.scikit-build.cmake]
+build-type = "Release"
 
 [project.scripts]
 pycumin = "pycumin.cumin:main"
