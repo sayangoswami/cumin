@@ -1,13 +1,11 @@
-import os
 import sys
 from dataclasses import dataclass
-from http.client import responses
 from pathlib import Path
 from typing import Optional, Any, Iterable
 
 import attrs
 
-from . import Index, Alignment
+from . import Index
 
 
 @dataclass
