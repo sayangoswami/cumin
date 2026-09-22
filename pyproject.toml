@@ -12,3 +12,6 @@ authors = [
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[project.scripts]
+pycumin = "pycumin.cumin:main"
