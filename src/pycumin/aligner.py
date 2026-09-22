@@ -1,3 +1,4 @@
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +58,12 @@ class Aligner:
         else:
             self.input = kwargs['input']
         self.threshold = kwargs.get('threshold', 0.15)
+        if 'n_threads' in kwargs:
+            n_threads = int(kwargs.pop('n_threads'))
+            if n_threads > 0:
+                os.environ['PARLAY_NUM_THREADS'] = str(n_threads)
+        else:
+            os.environ['PARLAY_NUM_THREADS'] = '1'
         self.aligner = Index()
         self.aligner.load(self.input)
 
