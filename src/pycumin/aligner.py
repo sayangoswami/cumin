@@ -60,7 +60,7 @@ class Aligner:
 
     def validate(self) -> None:
         input: str = self.kwargs["input"]
-        file_extensions = [".npx"]
+        file_extensions = [".npz"]
         if all((not Path(input).is_file(), input)):
             raise FileNotFoundError(f"{input} does not exist")
         if not any(input.lower().endswith(suffix) for suffix in file_extensions):
