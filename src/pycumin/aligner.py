@@ -56,7 +56,7 @@ class Aligner:
         else:
             self.input = kwargs['input']
         self.threshold = kwargs.get('threshold', 0.15)
-        self.aligner = Index(self.input)
+        self.aligner = Index.load(self.input)
 
     def validate(self) -> None:
         input: str = self.kwargs["input"]
