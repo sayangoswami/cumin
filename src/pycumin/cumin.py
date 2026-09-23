@@ -166,28 +166,38 @@ def score_reads(ix, reads, label, max_qbp=None):
     max_qbp truncates each read to its first max_qbp bases. Adaptive sampling
     decides on the leading fragment, so sweeping this is the latency curve:
     how few bases are needed before the keep/reject call can be made.
+
+    eval/demo have every read available upfront (unlike Aligner.map_reads'
+    live per-read MinKNOW stream), so this uses query_batch() -- parallel
+    across reads -- instead of one query() call at a time.
     """
-    ids, sc, na, lo, qlen = [], [], [], [], []
+    headers, seqs = [], []
     for h, seq in reads:
         if max_qbp:
             seq = seq[:max_qbp]
         if len(seq) < ix.p.k + 5:
             continue
-        qlen.append(len(seq))
-        r = ix.query(seq)
-        ids.append(h.split()[0])
-        sc.append(r.score)
-        na.append(r.n_anchors)
+        headers.append(h)
+        seqs.append(seq)
+
+    results = ix.query_batch(seqs)
+
+    ids = [h.split()[0] for h in headers]
+    sc = np.array([r.score for r in results])
+    na = np.array([r.n_anchors for r in results])
+    lo = np.empty(len(results), np.int8)
+    for i, (h, r) in enumerate(zip(headers, results)):
         truth = parse_header(h)
         if truth is not None and r.window >= 0:
             rn, wstart = ix.window_locus(r.window)
-            lo.append(1 if (rn == truth[0] and wstart < truth[2]
-                            and wstart + ix.p.win > truth[1]) else 0)
+            lo[i] = 1 if (rn == truth[0] and wstart < truth[2]
+                          and wstart + ix.p.win > truth[1]) else 0
         else:
-            lo.append(-1)
-    mq = float(np.mean(qlen)) if qlen else 0.0
+            lo[i] = -1
+
+    mq = float(np.mean([len(s) for s in seqs])) if seqs else 0.0
     log(f"  {label}: scored {len(ids):,} reads (mean {mq:.0f} bp)")
-    return ids, np.array(sc), np.array(na), np.array(lo, np.int8), mq
+    return ids, sc, na, lo, mq
 
 
 def auroc(p, n):
@@ -225,19 +235,36 @@ def cmd_map(a):
     ix.load(a.index)
     log(f"loaded {a.index}: {ix.n_entries:,} entries, {ix.nbytes()/1e9:.2f} GB, {ix.p}")
     n, t0 = 0, time.time()
+
+    # Batched (query_batch, parallel across reads) like cumin's native `map`
+    # CLI (main.cpp) -- all reads in the file are available upfront here,
+    # unlike Aligner.map_reads' live per-read MinKNOW stream, so there's no
+    # reason to query one at a time. BATCH_SZ matches main.cpp's.
+    BATCH_SZ = 4096
+
+    def flush(fh, ids, seqs):
+        for h, seq, r in zip(ids, seqs, ix.query_batch(seqs)):
+            ref, ws = ix.window_locus(r.window) if r.window >= 0 else ("*", -1)
+            fh.write(f"{h.split()[0]}\t{len(seq)}\t{r.score:.6f}\t{r.n_anchors}\t{r.strand}\t"
+                     f"{ref}\t{ws}\t{'keep' if r.score > a.threshold else 'reject'}\n")
+
     with open(a.out, "w") as fh:
         fh.write("read_id\tquery_bp\tscore\tn_anchors\tstrand\tref\t"
                  "window_start\tdecision\n")
+        ids, seqs = [], []
         for h, seq in read_reads(a.reads, a.max_reads):
             if a.max_query_bp:
                 seq = seq[:a.max_query_bp]
             if len(seq) < ix.p.k + 5:
                 continue
-            r = ix.query(seq)
-            ref, ws = ix.window_locus(r.window) if r.window >= 0 else ("*", -1)
-            fh.write(f"{h.split()[0]}\t{len(seq)}\t{r.score:.6f}\t{r.n_anchors}\t{r.strand}\t"
-                     f"{ref}\t{ws}\t{'keep' if r.score > a.threshold else 'reject'}\n")
+            ids.append(h)
+            seqs.append(seq)
             n += 1
+            if len(seqs) >= BATCH_SZ:
+                flush(fh, ids, seqs)
+                ids, seqs = [], []
+        if seqs:
+            flush(fh, ids, seqs)
     dt = time.time() - t0
     log(f"{n:,} reads in {dt:.1f}s ({1000*dt/max(n,1):.2f} ms/read) -> {a.out}")
 

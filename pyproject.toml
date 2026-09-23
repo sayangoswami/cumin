@@ -4,7 +4,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "pycumin"
-version = "0.1.0.dev3"
+version = "0.1.0.dev4"
 description = "Containment-based Unordered Mapping Index for Nanopore"
 authors = [
     { name="Sayan Goswami", email="sgoswami@smcm.edu" }
