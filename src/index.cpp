@@ -5,6 +5,7 @@
 #include "index.h"
 #include "parlay/primitives.h"
 #include "parlay/parallel.h"
+#include "parlay/slice.h"
 #include <algorithm>
 #include <limits>
 #include <cmath>
@@ -360,7 +361,13 @@ index_t::vote_result_t index_t::vote(const parlay::sequence<u8> &anchors) const 
     for (auto idx: which) total += cnt[idx];
     if (total == 0) return {0.0f, -1, (u4)nq};
 
-    auto gathered = gather_ranges(wsorted, starts, cnt, which);
+    // Dedup each matched key's own postings before pooling them together
+    auto per_key = parlay::map(which, [&](size_t idx) {
+        u8 from = starts[idx], to = from + cnt[idx];
+        auto sub = parlay::sort(parlay::slice(wsorted.begin() + from, wsorted.begin() + to));
+        return parlay::unique(sub);
+    });
+    auto gathered = parlay::flatten(std::move(per_key));
     parlay::integer_sort_inplace(gathered);
     auto runs = find_runs(gathered);
 
@@ -382,19 +389,6 @@ index_t::query_result_t index_t::query(const std::string &seq) const {
 }
 
 // ---------------------- scalar batch-query path -------------------------
-//
-// query()/vote() above parallelize *inside* a single read (parlay::sort,
-// parlay::tabulate, ..., each allocating its own parlay::sequence) -- fine
-// for a one-off standalone query, but at typical read lengths (a few
-// hundred bases => a few dozen anchors) that's several small heap
-// allocations and scheduler dispatches for essentially no real parallel
-// work. The actual embarrassingly-parallel structure of mapping is
-// *across* reads, so query_batch() parallelizes there instead (one task
-// per read, parlay::parallel_for) and keeps each read's own work scalar
-// and allocation-free in steady state via a per-worker-thread reused
-// heavy-hitter counter + anchor scratch buffer -- the same split
-// collinearity draws between query_fasta/query_batch (batch-parallel) and
-// search()'s scalar, heavyhitter_ht_t-based matching.
 
 void index_t::init_query_buffers() {
     if (hhs) return;
@@ -402,7 +396,7 @@ void index_t::init_query_buffers() {
     scratch = new query_scratch_t[parlay::num_workers()];
 }
 
-index_t::vote_result_t index_t::vote_scalar(std::vector<u8> &anchors, heavyhitter_ht_t<u4> &hh) const {
+index_t::vote_result_t index_t::vote_scalar(std::vector<u8> &anchors, std::vector<u4> &dedup_buf, heavyhitter_ht_t<u4> &hh) const {
     if (anchors.empty() || ufeat.empty()) return {0.0f, -1, 0};
     std::sort(anchors.begin(), anchors.end());
 
@@ -415,7 +409,17 @@ index_t::vote_result_t index_t::vote_scalar(std::vector<u8> &anchors, heavyhitte
         if (it == ufeat.end() || *it != anchors[i]) continue;
         size_t idx = (size_t)(it - ufeat.begin());
         u8 from = starts[idx], to = from + cnt[idx];
-        for (u8 j = from; j < to; ++j) hh.insert(wsorted[j]);
+
+        // Dedup this key's own postings before voting
+        dedup_buf.assign(wsorted.begin() + from, wsorted.begin() + to);
+        std::sort(dedup_buf.begin(), dedup_buf.end());
+        u4 prev = 0;
+        bool first = true;
+        for (u4 w: dedup_buf) {
+            if (first || w != prev) hh.insert(w);
+            prev = w;
+            first = false;
+        }
     }
     if (hh.top_key == (u4)-1) return {0.0f, -1, nq};
     return {(float)hh.top_count / (float)nq, (i8)hh.top_key, nq};
@@ -423,8 +427,8 @@ index_t::vote_result_t index_t::vote_scalar(std::vector<u8> &anchors, heavyhitte
 
 index_t::query_result_t index_t::query_scalar(const std::string &seq, query_scratch_t &sc, heavyhitter_ht_t<u4> &hh) const {
     read_anchors_scalar(seq, p.k, p.s, p.t, p.downsample, sc);
-    auto vf = vote_scalar(sc.fwd_hashes, hh);
-    auto vr = vote_scalar(sc.rev_hashes, hh);
+    auto vf = vote_scalar(sc.fwd_hashes, sc.dedup_buf, hh);
+    auto vr = vote_scalar(sc.rev_hashes, sc.dedup_buf, hh);
     if (vf.score >= vr.score) return {vf.score, vf.window, '+', vf.n_unique};
     return {vr.score, vr.window, '-', vr.n_unique};
 }

@@ -35,13 +35,6 @@ struct heavyhitter_ht_t {
     T top_key = (T)-1;
     u4 top_count = 0;
 
-    // NB: this checks the count *after* incorporating this insertion (unlike
-    // collinearity's version, which compares the pre-increment count -- that
-    // makes top_count always one less than the true max, and a key that only
-    // ever occurs once never registers as the leader at all. Harmless there
-    // since only the *relative* ranking of candidates is used; here
-    // top_count is the vote() score's numerator directly, so it has to be
-    // the real count.
     void insert(const T key) {
         if (!overflowed) {
             for (u4 i = 0; i < n; ++i) {
@@ -105,10 +98,6 @@ public:
                       size_t batch = 20'000'000, size_t chunk = 32'000'000);
     ~index_t();
 
-    // Always constructed in place / held by reference -- never moved or
-    // copied anywhere in this codebase. Left non-movable rather than
-    // implementing a correct move for the owning hhs/scratch raw pointers
-    // (see init_query_buffers()) that nothing currently needs.
     index_t(const index_t&) = delete;
     index_t& operator=(const index_t&) = delete;
     index_t(index_t&&) = delete;
@@ -177,10 +166,6 @@ private:
     std::filesystem::path bucket_dir;
     std::vector<std::ofstream> bucket_ffiles, bucket_wfiles; // low-mem only, NB each
 
-    // staging: chunks of (feature,window) pairs waiting to be filed. In
-    // low-mem mode these are periodically radix-partitioned to the NB disk
-    // buckets (flush_low_mem()); in high-mem mode they just keep growing
-    // until build() concatenates and sorts everything in one shot.
     std::vector<parlay::sequence<u8>> stage_feat;
     std::vector<parlay::sequence<u4>> stage_win;
     size_t pending = 0;
@@ -198,13 +183,10 @@ private:
     void flush_low_mem();
     [[nodiscard]] std::pair<parlay::sequence<u8>, parlay::sequence<u4>> read_bucket(u4 i) const;
 
-    // query_batch()'s scalar path: one heavy-hitter counter + one anchor
-    // scratch buffer per worker thread, allocated once by init_query_buffers()
-    // and reused across every read that thread processes.
     heavyhitter_ht_t<u4> *hhs = nullptr;
     query_scratch_t *scratch = nullptr;
 
-    [[nodiscard]] vote_result_t vote_scalar(std::vector<u8> &anchors, heavyhitter_ht_t<u4> &hh) const;
+    [[nodiscard]] vote_result_t vote_scalar(std::vector<u8> &anchors, std::vector<u4> &dedup_buf, heavyhitter_ht_t<u4> &hh) const;
     [[nodiscard]] query_result_t query_scalar(const std::string &seq, query_scratch_t &sc, heavyhitter_ht_t<u4> &hh) const;
 };
 

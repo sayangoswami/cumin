@@ -205,6 +205,7 @@ struct query_scratch_t {
     std::vector<u1> codes, rc, s_bad, k_bad;
     std::vector<u8> s_vals, k_vals, s_hash;
     std::vector<u8> fwd_hashes, rev_hashes;
+    std::vector<u4> dedup_buf; // index_t::vote_scalar's per-key window-id dedup scratch
 };
 
 /** Same open-syncmer selection as syncmer_anchors(), scalar, appending hashes to `out`. */
