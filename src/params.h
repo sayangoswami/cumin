@@ -15,6 +15,12 @@ struct params_t {
     u4 k = 15, s = 8, t = 0, downsample = 2;
     u4 win = 4000;
     float max_occ_pct = 99.9f;
+    // Overlap factor T: windows start every step = win/T bases, so every
+    // anchor lies in exactly T consecutive windows and any read of length
+    // <= win - step is wholly contained in at least one. The index stores
+    // one window id per anchor regardless of T (see index_t), so T costs
+    // query-time votes, not index bytes.
+    u4 overlap = 2;
     // Build-time only (not stored in the index -- see index_t::build): true
     // streams anchors through 256 on-disk radix buckets so the whole raw
     // anchor array never has to fit in RAM; false collects everything in one
@@ -25,28 +31,32 @@ struct params_t {
 
     params_t() = default;
 
-    params_t(u4 k, u4 s, u4 t, u4 downsample, u4 win, float max_occ_pct, bool low_mem = true):
-        k(k), s(s), t(t), downsample(downsample), win(win), max_occ_pct(max_occ_pct), low_mem(low_mem) {
+    params_t(u4 k, u4 s, u4 t, u4 downsample, u4 win, float max_occ_pct, bool low_mem = true, u4 overlap = 2):
+        k(k), s(s), t(t), downsample(downsample), win(win), max_occ_pct(max_occ_pct), overlap(overlap), low_mem(low_mem) {
         if (s >= k) log_error("s must be smaller than k");
         if (t > k - s) log_error("t must be in [0, %u]", k - s);
+        if (overlap < 1 || overlap > 64 || win % overlap != 0)
+            log_error("overlap must be in [1, 64] and divide win (win=%u, overlap=%u)", win, overlap);
     }
+
+    [[nodiscard]] u4 step() const { return win / overlap; }
 
     [[nodiscard]] float density() const {
         return 1.0f / (float)((k - s + 1) * downsample);
     }
 
     void dump(std::ostream &f) const {
-        dump_values(f, k, s, t, downsample, win, max_occ_pct);
+        dump_values(f, k, s, t, downsample, win, max_occ_pct, overlap);
     }
 
     void load(std::istream &f) {
-        load_values(f, &k, &s, &t, &downsample, &win, &max_occ_pct);
+        load_values(f, &k, &s, &t, &downsample, &win, &max_occ_pct, &overlap);
     }
 
     [[nodiscard]] std::string to_string() const {
         char buf[256];
-        snprintf(buf, sizeof(buf), "k=%u s=%u t=%u downsample=%u win=%u density~1/%.0f",
-                 k, s, t, downsample, win, 1.0f / density());
+        snprintf(buf, sizeof(buf), "k=%u s=%u t=%u downsample=%u win=%u overlap=%u density~1/%.0f",
+                 k, s, t, downsample, win, overlap, 1.0f / density());
         return buf;
     }
 };

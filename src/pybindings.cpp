@@ -91,8 +91,8 @@ struct Index {
 
     explicit Index(u4 k = 15, u4 s = 8, u4 t = 0, u4 downsample = 2, u4 win = 4000,
                     float max_occ_pct = 99.9f, bool low_mem = true, std::string tmpdir = "/tmp",
-                    size_t batch = 20'000'000, size_t chunk = 32'000'000):
-        ix(params_t(k, s, t, downsample, win, max_occ_pct, low_mem), std::move(tmpdir), batch, chunk) {}
+                    size_t batch = 20'000'000, size_t chunk = 32'000'000, u4 overlap = 2):
+        ix(params_t(k, s, t, downsample, win, max_occ_pct, low_mem, overlap), std::move(tmpdir), batch, chunk) {}
 
     u8 add_record(std::string &name, std::string &seq) { return ix.add_record(name, seq); }
     void build(int sample_buckets = 16) { ix.build(sample_buckets); }
@@ -142,6 +142,8 @@ struct Index {
     [[nodiscard]] u8 n_entries() const { return ix.n_entries; }
     [[nodiscard]] u8 n_dropped() const { return ix.n_dropped; }
     [[nodiscard]] u4 occ_cutoff() const { return ix.occ_cutoff; }
+    [[nodiscard]] u8 n_keys() const { return ix.n_keys(); }
+    [[nodiscard]] u8 n_windows() const { return ix.n_windows(); }
     [[nodiscard]] std::string params_str() const { return ix.p.to_string(); }
     [[nodiscard]] params_t params() const { return ix.p; }
 };
@@ -178,6 +180,7 @@ PYBIND11_MODULE(_core, m) {
             .def_readonly("downsample", &params_t::downsample)
             .def_readonly("win", &params_t::win)
             .def_readonly("max_occ_pct", &params_t::max_occ_pct)
+            .def_readonly("overlap", &params_t::overlap)
             .def_readonly("low_mem", &params_t::low_mem)
             .def_property_readonly("density", &params_t::density)
             .def("__repr__", &params_t::to_string);
@@ -197,10 +200,11 @@ PYBIND11_MODULE(_core, m) {
             .def("__next__", &QueryResponseGenerator::next);
 
     py::class_<Index>(m, "Index")
-            .def(py::init<u4, u4, u4, u4, u4, float, bool, std::string, size_t, size_t>(),
+            .def(py::init<u4, u4, u4, u4, u4, float, bool, std::string, size_t, size_t, u4>(),
                  py::arg("k") = 15, py::arg("s") = 8, py::arg("t") = 0, py::arg("downsample") = 2,
                  py::arg("win") = 4000, py::arg("max_occ_pct") = 99.9f, py::arg("low_mem") = true,
-                 py::arg("tmpdir") = "/tmp", py::arg("batch") = 20'000'000, py::arg("chunk") = 32'000'000)
+                 py::arg("tmpdir") = "/tmp", py::arg("batch") = 20'000'000, py::arg("chunk") = 32'000'000,
+                 py::arg("overlap") = 2)
             .def("add_record", &Index::add_record, py::arg("name"), py::arg("seq"))
             .def("build", &Index::build, py::arg("sample_buckets") = 16)
             .def("save", &Index::save, py::arg("path"))
@@ -213,6 +217,8 @@ PYBIND11_MODULE(_core, m) {
             .def_property_readonly("n_entries", &Index::n_entries)
             .def_property_readonly("n_dropped", &Index::n_dropped)
             .def_property_readonly("occ_cutoff", &Index::occ_cutoff)
+            .def_property_readonly("n_keys", &Index::n_keys)
+            .def_property_readonly("n_windows", &Index::n_windows)
             .def_property_readonly("p", &Index::params)
             .def("__repr__", &Index::params_str);
 }

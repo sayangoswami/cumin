@@ -20,6 +20,8 @@ struct build_args_t : argparse::Args {
     int &t = kwarg("t", "syncmer offset (0 = open)").set_default(0);
     int &downsample = kwarg("downsample", "density = 1/((k-s+1)*downsample)").set_default(2);
     int &win = kwarg("win", "reference window (bp)").set_default(4000);
+    int &overlap = kwarg("overlap", "overlap factor T: windows start every win/T bp; reads up to "
+        "win - win/T bp are contained in one window. Costs query votes, not index bytes").set_default(2);
     float &max_occ_pct = kwarg("max-occ-pct", "drop features above this occurrence percentile").set_default(99.9f);
     bool &high_mem = flag("high-mem", "sort the whole reference's anchors in memory in one pass "
         "instead of streaming through on-disk radix buckets; faster if it fits in RAM.");
@@ -28,7 +30,7 @@ struct build_args_t : argparse::Args {
     int &chunk = kwarg("chunk", "max bp of one record processed at a time").set_default(32'000'000);
 
     [[nodiscard]] params_t to_params() const {
-        return {(u4)k, (u4)s, (u4)t, (u4)downsample, (u4)win, max_occ_pct, !high_mem};
+        return {(u4)k, (u4)s, (u4)t, (u4)downsample, (u4)win, max_occ_pct, !high_mem, (u4)overlap};
     }
 
     int run() override {
@@ -49,8 +51,11 @@ struct build_args_t : argparse::Args {
                  (double)bp / (double)MAX(anchors, (u8)1));
 
         ix.build();
-        log_info("  %llu entries, occ cutoff %u, %llu repeat features suppressed, %.2f GB (%.2f B/base)",
-                 (unsigned long long)ix.n_entries, ix.occ_cutoff, (unsigned long long)ix.n_dropped,
+        log_info("  %llu entries, %llu distinct keys, %llu windows (%u-bit ids, %s offsets)",
+                 (unsigned long long)ix.n_entries, (unsigned long long)ix.n_keys(),
+                 (unsigned long long)ix.n_windows(), ix.window_bits(), ix.wide_offsets() ? "64-bit" : "32-bit");
+        log_info("  occ cutoff %u, %llu repeat features suppressed, %.2f GB (%.3f B/base)",
+                 ix.occ_cutoff, (unsigned long long)ix.n_dropped,
                  ix.nbytes() / 1e9, (double)ix.nbytes() / (double)MAX(bp, (u8)1));
 
         std::ofstream fout(idx, std::ios::binary);

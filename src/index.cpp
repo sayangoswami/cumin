@@ -53,9 +53,8 @@ static runs_t<T> find_runs(const parlay::sequence<T> &vals) {
 
 /**
  * Gather src[range_starts[w]..range_starts[w]+range_counts[w]) for every w in
- * `which`, concatenated in order. Used both to compact kept runs into the
- * final wsorted array (build()) and to gather a query's matched postings
- * (vote()).
+ * `which`, concatenated in order. Used to compact kept runs into the final
+ * window-id array (build()).
  */
 template <typename T, typename OffT>
 static parlay::sequence<T> gather_ranges(const parlay::sequence<T> &src,
@@ -74,6 +73,38 @@ static parlay::sequence<T> gather_ranges(const parlay::sequence<T> &src,
     });
 }
 
+/**
+ * Occurrence count of every run for the repeat filter: the number of
+ * (anchor, window) memberships, i.e. the run length the index had when it
+ * stored every window an anchor lies in. Weighting by window keeps the
+ * filter -- and so the set of dropped keys -- exactly what it was before
+ * the index stored one id per anchor. See index_t::window_weights().
+ */
+static parlay::sequence<u4> weighted_run_counts(const runs_t<u8> &runs, const parlay::sequence<u4> &w,
+                                                 const parlay::sequence<u1> &weight) {
+    return parlay::tabulate(runs.starts.size(), [&](size_t i) {
+        u4 c = 0;
+        for (size_t j = runs.starts[i], e = j + runs.counts[i]; j < e; ++j) c += weight[w[j]];
+        return c;
+    });
+}
+
+/**
+ * Every window voted for by one key: the union of [j-T+1, j] over the
+ * key's stored ids `ids` (sorted ascending, may repeat), in ascending
+ * order and without duplicates -- so one anchor votes at most once per
+ * window (the double-voting fix).
+ */
+template <typename F>
+static inline void expand_windows(const u4 *ids, size_t n, u4 T, F &&emit) {
+    u8 next = 0; // lowest window id not yet emitted
+    for (size_t i = 0; i < n; ++i) {
+        u8 j = ids[i], lo = MAX(next, j + 1 >= T ? j + 1 - T : 0);
+        for (u8 w = lo; w <= j; ++w) emit((u4)w);
+        next = MAX(next, j + 1);
+    }
+}
+
 // Occurrence-cutoff percentile over per-feature counts. A heuristic knob -
 // drop features occurring above this percentile
 static u4 calc_occ_cutoff(parlay::sequence<u4> counts, float pct) {
@@ -87,7 +118,7 @@ static u4 calc_occ_cutoff(parlay::sequence<u4> counts, float pct) {
 // -----------------------------------------------------------------------
 
 index_t::index_t(params_t params, std::string tmpdir_, size_t batch_, size_t chunk_):
-    p(params), win_step(params.win / 2), tmpdir(std::move(tmpdir_)), batch(batch_), chunk(chunk_) {}
+    p(params), win_step(params.step()), tmpdir(std::move(tmpdir_)), batch(batch_), chunk(chunk_) {}
 
 index_t::~index_t() {
     for (auto &fh: bucket_ffiles) if (fh.is_open()) fh.close();
@@ -115,21 +146,29 @@ void index_t::open_buckets() {
     buckets_open = true;
 }
 
-void index_t::file_anchors(const parlay::sequence<u8> &pos, const parlay::sequence<u8> &feat, u8 base, u8 nwin) {
-    size_t n = pos.size();
-    for (int shift : {0, -1}) {
-        auto keep = parlay::tabulate(n, [&](size_t i) {
-            i8 ww = (i8)(pos[i] / win_step) + shift;
-            return ww >= 0 && (u8)ww < nwin;
-        });
-        auto idx = parlay::pack_index(keep);
-        if (idx.empty()) continue;
-        auto f = parlay::map(idx, [&](size_t i) { return feat[i]; });
-        auto w = parlay::map(idx, [&](size_t i) { return (u4)((i8)(pos[i] / win_step) + shift + (i8)base); });
-        pending += idx.size();
-        stage_feat.push_back(std::move(f));
-        stage_win.push_back(std::move(w));
+// One entry per anchor: the highest window containing it (j_max). `base`
+// is the record's first *real* window id, i.e. already past its padding.
+void index_t::file_anchors(const parlay::sequence<u8> &pos, const parlay::sequence<u8> &feat, u8 base) {
+    if (pos.empty()) return;
+    auto w = parlay::map(pos, [&](u8 p_) { return (u4)(base + p_ / win_step); });
+    pending += pos.size();
+    stage_feat.push_back(feat);
+    stage_win.push_back(std::move(w));
+}
+
+// Per window id: how many windows of the old every-window layout an anchor
+// with this j_max was filed under -- T, except within the first T-1 real
+// windows of a record, where the lower windows don't exist. Padding windows
+// never appear as a stored j_max; they get 0.
+parlay::sequence<u1> index_t::window_weights() const {
+    const u4 T = p.overlap;
+    parlay::sequence<u1> wt(base_win, (u1)T);
+    for (size_t r = 0; r < rec_first.size(); ++r) {
+        u8 first = rec_first[r], end = (r + 1 < rec_first.size()) ? rec_first[r + 1] : base_win;
+        for (u8 i = 0; i < T - 1 && first + i < end; ++i) wt[first + i] = 0;
+        for (u8 j = 0; j + 1 < T && first + T - 1 + j < end; ++j) wt[first + T - 1 + j] = (u1)(j + 1);
     }
+    return wt;
 }
 
 u8 index_t::add_record(const std::string &name, const std::string &seq) {
@@ -138,8 +177,11 @@ u8 index_t::add_record(const std::string &name, const std::string &seq) {
     u8 nwin = MAX((u8)1, L / win_step + 1);
     rec_names.push_back(name);
     rec_first.push_back(base_win);
-    u8 base = base_win;
-    base_win += nwin;
+    u8 base = base_win + (p.overlap - 1); // skip this record's padding windows
+    base_win = base + nwin;
+    if (base_win >= (u8)std::numeric_limits<u4>::max())
+        log_error("reference has too many windows (%llu) for 32-bit window ids; increase --win",
+                  (unsigned long long)base_win);
 
     u8 pad = p.k + 4096;
     u8 step = MAX((u8)chunk, pad * 4);
@@ -160,7 +202,7 @@ u8 index_t::add_record(const std::string &name, const std::string &seq) {
                 auto pos = parlay::map(idx, [&](size_t i) { return a.positions[i] + lo; });
                 auto feat = parlay::map(idx, [&](size_t i) { return a.hashes[i]; });
                 n_anchor += pos.size();
-                file_anchors(pos, feat, base, nwin);
+                file_anchors(pos, feat, base);
             }
         }
         start = end;
@@ -213,12 +255,14 @@ void index_t::build(int sample_buckets) {
     std::vector<parlay::sequence<u4>> cn_parts;
     std::vector<parlay::sequence<u4>> ws_parts;
     u8 dropped = 0;
+    auto weight = window_weights();
 
     auto consume_sorted = [&](parlay::sequence<u8> &&f, parlay::sequence<u4> &&w) {
         if (f.empty()) return;
         auto runs = find_runs(f);
         size_t m = runs.starts.size();
-        auto keep = parlay::tabulate(m, [&](size_t i) { return runs.counts[i] <= occ_cutoff; });
+        auto occ = weighted_run_counts(runs, w, weight);
+        auto keep = parlay::tabulate(m, [&](size_t i) { return occ[i] <= occ_cutoff; });
         auto keep_idx = parlay::pack_index(keep);
         dropped += (m - keep_idx.size());
         if (keep_idx.empty()) return;
@@ -232,7 +276,7 @@ void index_t::build(int sample_buckets) {
 
     if (p.low_mem && !buckets_open) {
         // add_record() was never called -- nothing was ever filed.
-        ufeat = {}; cnt = {}; wsorted = {}; starts = {};
+        ufeat = {}; offsets = {}; windows = {};
         return;
     }
 
@@ -254,8 +298,7 @@ void index_t::build(int sample_buckets) {
             u4 stride = MAX((u4)1, NB / (u4)sample_buckets);
             for (u4 i = 0; i < NB; i += stride) {
                 auto [f, w] = read_bucket(i);
-                (void)w;
-                if (!f.empty()) samples.push_back(find_runs(f).counts);
+                if (!f.empty()) samples.push_back(weighted_run_counts(find_runs(f), w, weight));
             }
             occ_cutoff = samples.empty() ? std::numeric_limits<u4>::max()
                                           : calc_occ_cutoff(parlay::flatten(std::move(samples)), p.max_occ_pct);
@@ -282,23 +325,27 @@ void index_t::build(int sample_buckets) {
         auto swin  = parlay::map(perm, [&](size_t i) { return win[i]; });
 
         occ_cutoff = (p.max_occ_pct >= 100.0f) ? std::numeric_limits<u4>::max()
-                                                : calc_occ_cutoff(find_runs(sfeat).counts, p.max_occ_pct);
+                                                : calc_occ_cutoff(weighted_run_counts(find_runs(sfeat), swin, weight), p.max_occ_pct);
         consume_sorted(std::move(sfeat), std::move(swin));
     }
 
     n_dropped = dropped;
     if (!uf_parts.empty()) {
         ufeat = parlay::flatten(std::move(uf_parts));
-        cnt = parlay::flatten(std::move(cn_parts));
-        wsorted = parlay::flatten(std::move(ws_parts));
-        starts = parlay::sequence<u8>(cnt.size());
-        u8 running = 0;
-        for (size_t i = 0; i < cnt.size(); ++i) { starts[i] = running; running += cnt[i]; }
+        auto cnt = parlay::flatten(std::move(cn_parts));
+        auto [off, total] = parlay::scan(parlay::map(cnt, [](u4 c) { return (u8)c; }));
+        off.push_back(total);
+        offsets = {};
+        offsets.wide = total > (u8)std::numeric_limits<u4>::max();
+        if (offsets.wide) offsets.o64 = std::move(off);
+        else offsets.o32 = parlay::map(off, [](u8 o) { return (u4)o; });
+
+        auto ws = parlay::flatten(std::move(ws_parts));
+        windows.pack(ws, packed_array_t::bits_for(MAX(base_win, (u8)1) - 1));
     } else {
         ufeat = {};
-        cnt = {};
-        wsorted = {};
-        starts = {};
+        offsets = {};
+        windows = {};
     }
 
     if (p.low_mem) {
@@ -307,38 +354,64 @@ void index_t::build(int sample_buckets) {
     }
 }
 
+// Header layout (format version 2):
+//   magic u4, version u2, key width u1 (64), key encoding u1 (0 = hash),
+//   offset width u1 (32/64), window id bits u1, then params_t (incl. overlap).
+// The loader refuses anything else rather than misreading it.
 void index_t::save(std::ostream &f) const {
+    u1 key_bits = 64, key_enc = 0, off_bits = offsets.wide ? 64 : 32, win_bits = (u1)windows.width;
+    dump_values(f, MAGIC, FORMAT_VERSION, key_bits, key_enc, off_bits, win_bits);
     p.dump(f);
     dump_strings(f, rec_names);
     dump_seq(f, rec_first);
-    dump_values(f, occ_cutoff, n_entries, n_dropped);
+    dump_values(f, occ_cutoff, n_entries, n_dropped, base_win);
     dump_seq(f, ufeat);
-    dump_seq(f, starts);
-    dump_seq(f, cnt);
-    dump_seq(f, wsorted);
+    if (offsets.wide) dump_seq(f, offsets.o64);
+    else dump_seq(f, offsets.o32);
+    dump_values(f, windows.n);
+    dump_seq(f, windows.words);
 }
 
 void index_t::load(std::istream &f) {
+    u4 magic = 0;
+    u2 version = 0;
+    u1 key_bits = 0, key_enc = 0, off_bits = 0, win_bits = 0;
+    load_values(f, &magic);
+    if (!f || magic != MAGIC)
+        log_error("not a CUMIN index, or one written before the versioned format (v%u); rebuild it", FORMAT_VERSION);
+    load_values(f, &version, &key_bits, &key_enc, &off_bits, &win_bits);
+    if (version != FORMAT_VERSION)
+        log_error("index format version %u is not supported (expected %u)", version, FORMAT_VERSION);
+    if (key_bits != 64 || key_enc != 0 || (off_bits != 32 && off_bits != 64) || win_bits < 1 || win_bits > 32)
+        log_error("unsupported index layout: key %u-bit/enc %u, offsets %u-bit, window ids %u-bit",
+                  key_bits, key_enc, off_bits, win_bits);
+
     p.load(f);
-    win_step = p.win / 2;
+    win_step = p.step();
     load_strings(f, rec_names);
     load_seq(f, rec_first);
-    load_values(f, &occ_cutoff, &n_entries, &n_dropped);
+    load_values(f, &occ_cutoff, &n_entries, &n_dropped, &base_win);
     load_seq(f, ufeat);
-    load_seq(f, starts);
-    load_seq(f, cnt);
-    load_seq(f, wsorted);
+    offsets = {};
+    offsets.wide = off_bits == 64;
+    if (offsets.wide) load_seq(f, offsets.o64);
+    else load_seq(f, offsets.o32);
+    windows = {};
+    windows.width = win_bits;
+    load_values(f, &windows.n);
+    load_seq(f, windows.words);
+    if (!f) log_error("index file is truncated");
 }
 
 u8 index_t::nbytes() const {
-    return ufeat.size() * sizeof(u8) + starts.size() * sizeof(u8) +
-           cnt.size() * sizeof(u4) + wsorted.size() * sizeof(u4);
+    return ufeat.size() * sizeof(u8) + offsets.nbytes() + windows.nbytes();
 }
 
 std::pair<std::string, u8> index_t::window_locus(u8 wid) const {
     size_t r = (size_t)(std::upper_bound(rec_first.begin(), rec_first.end(), wid) - rec_first.begin());
     r = (r == 0) ? 0 : r - 1;
-    u8 wstart = (wid - rec_first[r]) * win_step;
+    u8 first_real = rec_first[r] + (p.overlap - 1);
+    u8 wstart = (wid > first_real ? wid - first_real : 0) * win_step;
     return {rec_names[r], wstart};
 }
 
@@ -357,23 +430,25 @@ index_t::vote_result_t index_t::vote(const parlay::sequence<u8> &anchors) const 
     if (hit_pos.empty()) return {0.0f, -1, (u4)nq};
 
     auto which = parlay::map(hit_pos, [&](size_t i) { return lo[i]; });
-    u8 total = 0;
-    for (auto idx: which) total += cnt[idx];
-    if (total == 0) return {0.0f, -1, (u4)nq};
 
-    // Dedup each matched key's own postings before pooling them together
+    // Each matched key votes once for every window its postings imply
+    const u4 T = p.overlap;
     auto per_key = parlay::map(which, [&](size_t idx) {
-        u8 from = starts[idx], to = from + cnt[idx];
-        auto sub = parlay::sort(parlay::slice(wsorted.begin() + from, wsorted.begin() + to));
-        return parlay::unique(sub);
+        u8 from = offsets[idx], to = offsets[idx + 1];
+        auto ids = parlay::sort(parlay::tabulate(to - from, [&](size_t j) { return windows.get(from + j); }));
+        parlay::sequence<u4> out;
+        expand_windows(ids.data(), ids.size(), T, [&](u4 w) { out.push_back(w); });
+        return out;
     });
     auto gathered = parlay::flatten(std::move(per_key));
+    if (gathered.empty()) return {0.0f, -1, (u4)nq};
     parlay::integer_sort_inplace(gathered);
     auto runs = find_runs(gathered);
 
+    // Ties go to the higher window id -- see heavyhitter_ht_t::bump
     size_t best = 0;
     for (size_t i = 1; i < runs.counts.size(); ++i)
-        if (runs.counts[i] > runs.counts[best]) best = i;
+        if (runs.counts[i] >= runs.counts[best]) best = i;
 
     u4 best_window = gathered[runs.starts[best]];
     u4 best_count = runs.counts[best];
@@ -408,18 +483,13 @@ index_t::vote_result_t index_t::vote_scalar(std::vector<u8> &anchors, std::vecto
         auto it = std::lower_bound(ufeat.begin(), ufeat.end(), anchors[i]);
         if (it == ufeat.end() || *it != anchors[i]) continue;
         size_t idx = (size_t)(it - ufeat.begin());
-        u8 from = starts[idx], to = from + cnt[idx];
+        u8 from = offsets[idx], to = offsets[idx + 1];
 
-        // Dedup this key's own postings before voting
-        dedup_buf.assign(wsorted.begin() + from, wsorted.begin() + to);
+        // Vote once for every window this key's postings imply
+        dedup_buf.resize(to - from);
+        for (u8 j = from; j < to; ++j) dedup_buf[j - from] = windows.get(j);
         std::sort(dedup_buf.begin(), dedup_buf.end());
-        u4 prev = 0;
-        bool first = true;
-        for (u4 w: dedup_buf) {
-            if (first || w != prev) hh.insert(w);
-            prev = w;
-            first = false;
-        }
+        expand_windows(dedup_buf.data(), dedup_buf.size(), p.overlap, [&](u4 w) { hh.insert(w); });
     }
     if (hh.top_key == (u4)-1) return {0.0f, -1, nq};
     return {(float)hh.top_count / (float)nq, (i8)hh.top_key, nq};

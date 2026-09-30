@@ -9,6 +9,7 @@
 #include "params.h"
 #include "cumin.h"
 #include "parlay/sequence.h"
+#include "parlay/parallel.h"
 #include <fstream>
 #include <filesystem>
 #include <unordered_map>
@@ -35,12 +36,19 @@ struct heavyhitter_ht_t {
     T top_key = (T)-1;
     u4 top_count = 0;
 
+    // Ties go to the higher key. For window ids this is what keeps the
+    // per-contig padding windows (see index_t) from ever being reported:
+    // a padding window's count never exceeds that of the real window just
+    // above it. It also makes the winner independent of insertion order.
+    inline void bump(const T key, const u4 count) {
+        if (count > top_count || (count == top_count && key > top_key)) top_count = count, top_key = key;
+    }
+
     void insert(const T key) {
         if (!overflowed) {
             for (u4 i = 0; i < n; ++i) {
                 if (keys[i] == key) {
-                    u4 count = ++counts[i];
-                    if (count > top_count) top_count = count, top_key = key;
+                    bump(key, ++counts[i]);
                     return;
                 }
             }
@@ -48,7 +56,7 @@ struct heavyhitter_ht_t {
                 keys[n] = key;
                 counts[n] = 1;
                 ++n;
-                if (1 > top_count) top_count = 1, top_key = key;
+                bump(key, 1);
                 return;
             }
             overflowed = true;
@@ -56,8 +64,7 @@ struct heavyhitter_ht_t {
             for (u4 i = 0; i < n; ++i) overflow_map[keys[i]] = counts[i];
             n = 0;
         }
-        u4 count = ++overflow_map[key];
-        if (count > top_count) top_count = count, top_key = key;
+        bump(key, ++overflow_map[key]);
     }
 
     void reset() {
@@ -72,12 +79,79 @@ struct heavyhitter_ht_t {
 };
 
 /**
+ * Fixed-width bit-packed array of unsigned integers, 1..32 bits each.
+ * Values are packed LSB-first into 64-bit words; one trailing padding word
+ * lets get() always do a single unaligned 8-byte load (little-endian only).
+ */
+struct packed_array_t {
+    u4 width = 0;
+    u8 n = 0;
+    parlay::sequence<u8> words;
+
+    /** Bits needed to represent every value in [0, max_val]. */
+    static u4 bits_for(u8 max_val) {
+        u4 b = 1;
+        while (b < 64 && (max_val >> b) != 0) ++b;
+        return b;
+    }
+
+    void pack(const parlay::sequence<u4> &vals, u4 width_) {
+        expect(width_ >= 1 && width_ <= 32);
+        width = width_;
+        n = vals.size();
+        // 64 values of `width` bits fill exactly `width` whole words, so each
+        // block of 64 is packed independently of its neighbours.
+        u8 nblocks = (n + 63) / 64;
+        words = parlay::sequence<u8>(nblocks * width + 1, 0);
+        parlay::parallel_for(0, nblocks, [&](size_t b) {
+            u8 *w = words.data() + b * width;
+            u8 lo = b * 64, hi = MIN(n, lo + 64);
+            for (u8 i = lo; i < hi; ++i) {
+                u8 v = vals[i], bit = (i - lo) * width, off = bit & 63;
+                w[bit >> 6] |= v << off;
+                if (off + width > 64) w[(bit >> 6) + 1] |= v >> (64 - off);
+            }
+        });
+    }
+
+    [[nodiscard]] inline u4 get(u8 i) const {
+        u8 bit = i * width, x;
+        std::memcpy(&x, reinterpret_cast<const char*>(words.data()) + (bit >> 3), sizeof(x));
+        return (u4)((x >> (bit & 7)) & ((1ULL << width) - 1));
+    }
+
+    [[nodiscard]] u8 nbytes() const { return words.size() * sizeof(u8); }
+};
+
+/**
+ * Compressed-sparse-row offsets (U+1 of them), stored 32-bit unless the
+ * number of entries they index reaches 2^32, in which case 64-bit.
+ */
+struct offsets_t {
+    bool wide = false;
+    parlay::sequence<u4> o32;
+    parlay::sequence<u8> o64;
+
+    [[nodiscard]] inline u8 operator[](size_t i) const { return wide ? o64[i] : (u8)o32[i]; }
+    [[nodiscard]] size_t size() const { return wide ? o64.size() : o32.size(); }
+    [[nodiscard]] u8 nbytes() const { return o32.size() * sizeof(u4) + o64.size() * sizeof(u8); }
+};
+
+/**
  * Anchors filed under overlapping reference windows.
  *
- * ufeat   u8   sorted unique anchor hashes
- * starts  u8   offset of each key's run in wsorted
- * cnt     u4   run length
- * wsorted u4   window ids, grouped by key
+ * ufeat    u8        sorted unique anchor hashes                     U
+ * offsets  u4 (u8)   CSR: key i's run is windows[offsets[i]..offsets[i+1])   U+1
+ * windows  packed    one window id per anchor, grouped by key        N
+ *
+ * Windows are `win` wide and start every step = win/T bases (T =
+ * params_t::overlap), so an anchor at p lies in exactly the T consecutive
+ * windows j_max-T+1 .. j_max, j_max = floor(p/step). Only j_max is stored;
+ * the tally votes for all T. Each record's window-id range is prefixed with
+ * T-1 padding windows so j_max-T+1 never reaches into the previous record:
+ * a padding window holds no anchors of its own, only inferred votes, so its
+ * count never exceeds the real window above it, and the higher-id tie-break
+ * (heavyhitter_ht_t::bump) means it never wins.
  *
  * Direct port of pycumin.cumin.Index (see cumin.py) -- see that docstring
  * for the method. Two build modes, selected by params_t::low_mem:
@@ -90,6 +164,9 @@ struct heavyhitter_ht_t {
 class index_t {
 public:
     static constexpr u4 NB = 256;
+
+    static constexpr u4 MAGIC = 0x4E4D5543; // "CUMN"
+    static constexpr u2 FORMAT_VERSION = 2;
 
     params_t p;
     u4 win_step;
@@ -156,6 +233,11 @@ public:
     u8 n_entries = 0, n_dropped = 0;
     u4 occ_cutoff = 0;
 
+    [[nodiscard]] u8 n_keys() const { return ufeat.size(); }
+    [[nodiscard]] u8 n_windows() const { return base_win; }
+    [[nodiscard]] u4 window_bits() const { return windows.width; }
+    [[nodiscard]] bool wide_offsets() const { return offsets.wide; }
+
 private:
     std::vector<std::string> rec_names;
     std::vector<u8> rec_first;
@@ -172,13 +254,13 @@ private:
 
     // built CSR arrays
     parlay::sequence<u8> ufeat;
-    parlay::sequence<u8> starts;
-    parlay::sequence<u4> cnt;
-    parlay::sequence<u4> wsorted;
+    offsets_t offsets;
+    packed_array_t windows;
 
     bool buckets_open = false;
 
-    void file_anchors(const parlay::sequence<u8> &pos, const parlay::sequence<u8> &feat, u8 base, u8 nwin);
+    void file_anchors(const parlay::sequence<u8> &pos, const parlay::sequence<u8> &feat, u8 base);
+    [[nodiscard]] parlay::sequence<u1> window_weights() const;
     void open_buckets();
     void flush_low_mem();
     [[nodiscard]] std::pair<parlay::sequence<u8>, parlay::sequence<u4>> read_bucket(u4 i) const;
