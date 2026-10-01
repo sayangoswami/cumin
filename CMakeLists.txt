@@ -18,7 +18,15 @@ add_subdirectory(external/pybind11)
 
 set(CORE_SOURCES
         src/index.cpp
+        src/dyn_index.cpp
+        src/tiered_buffer.cpp
 )
+
+# The tiered-vector header is configured by compile definitions and leaks
+# names, so it is confined to this one translation unit.
+set_source_files_properties(src/tiered_buffer.cpp PROPERTIES
+        COMPILE_DEFINITIONS "ARRAY;LEVEL;PACK"
+        INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/external/tiered-vector/include)
 
 set(PYBIND11_FINDPYTHON ON)
 pybind11_add_module(_core

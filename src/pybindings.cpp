@@ -4,6 +4,7 @@
 
 #include "cumin.h"
 #include "index.h"
+#include "dyn_index.h"
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
@@ -148,6 +149,88 @@ struct Index {
     [[nodiscard]] params_t params() const { return ix.p; }
 };
 
+/**
+ * Index that grows during a run (see dyn_index_t): `variant` is "lsm",
+ * "tiered" or "lsm-tiered". By default add_record() first queries the
+ * sequence's first check_bp bases and skips it if they already map.
+ */
+struct DynamicIndex {
+    dyn_index_t ix;
+
+    static dyn_params_t make_dparams(const std::string &variant, size_t buffer, u4 ratio, u4 max_occ, float threshold,
+                                     u4 check_bp, bool skip_mapped, size_t chunk) {
+        dyn_params_t dp;
+        dp.variant = parse_dyn_variant(variant);
+        dp.buffer = buffer;
+        dp.ratio = ratio;
+        dp.max_occ = max_occ > 0 ? max_occ : std::numeric_limits<u4>::max();
+        dp.threshold = threshold;
+        dp.check_bp = check_bp;
+        dp.skip_mapped = skip_mapped;
+        dp.chunk = chunk;
+        return dp;
+    }
+
+    DynamicIndex(u4 k, u4 s, u4 t, u4 downsample, u4 win, u4 overlap, const std::string &variant, size_t buffer,
+                 u4 ratio, u4 max_occ, float threshold, u4 check_bp, bool skip_mapped, size_t chunk):
+        ix(params_t(k, s, t, downsample, win, 100.0f, true, overlap),
+           make_dparams(variant, buffer, ratio, max_occ, threshold, check_bp, skip_mapped, chunk)) {}
+
+    bool add_record(const std::string &name, const std::string &seq, py::object skip_mapped) {
+        bool skip = skip_mapped.is_none() ? ix.dp.skip_mapped : skip_mapped.cast<bool>();
+        py::gil_scoped_release release;
+        return ix.add_record(name, seq, skip);
+    }
+
+    QueryResult query(const std::string &seq) { return QueryResult(ix.query(seq)); }
+
+    static std::vector<std::string> to_strings(const py::list &seqs) {
+        std::vector<std::string> v;
+        v.reserve(seqs.size());
+        for (auto &x: seqs) v.push_back(x.cast<std::string>());
+        return v;
+    }
+
+    std::vector<QueryResult> query_batch(const py::list &seqs) {
+        auto v = to_strings(seqs);
+        py::gil_scoped_release release;
+        auto results = ix.query_batch(v);
+        return {results.begin(), results.end()};
+    }
+
+    std::vector<QueryResult> decide(const py::list &seqs) {
+        auto v = to_strings(seqs);
+        py::gil_scoped_release release;
+        auto results = ix.decide(v);
+        return {results.begin(), results.end()};
+    }
+
+    QueryResponseGenerator query_stream(const py::iterator &reads) {
+        std::vector<std::string> ids, seqs;
+        for (auto &item: reads) {
+            auto req = item.cast<QueryRequest>();
+            ids.push_back(std::move(req.id));
+            seqs.push_back(std::move(req.seq));
+        }
+        auto results = ix.query_batch(seqs);
+        std::vector<QueryResponse> responses;
+        responses.reserve(results.size());
+        for (size_t i = 0; i < results.size(); ++i)
+            responses.emplace_back(std::move(ids[i]), QueryResult(results[i]));
+        return QueryResponseGenerator(std::move(responses));
+    }
+
+    [[nodiscard]] bool is_mapped(const QueryResult &r) const { return r.score > ix.dp.threshold; }
+    [[nodiscard]] std::pair<std::string, u8> window_locus(i8 wid) const { return ix.window_locus((u8)wid); }
+
+    [[nodiscard]] std::string repr() const {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "DynamicIndex(%s, buffer=%zu, ratio=%u) ", dyn_variant_name(ix.dp.variant),
+                 ix.dp.buffer, ix.dp.ratio);
+        return buf + ix.p.to_string();
+    }
+};
+
 PYBIND11_MODULE(_core, m) {
     py::class_<SyncmerAnchors>(m, "SyncmerAnchors")
             .def(py::init<>())
@@ -221,4 +304,37 @@ PYBIND11_MODULE(_core, m) {
             .def_property_readonly("n_windows", &Index::n_windows)
             .def_property_readonly("p", &Index::params)
             .def("__repr__", &Index::params_str);
+
+    py::class_<DynamicIndex>(m, "DynamicIndex")
+            .def(py::init<u4, u4, u4, u4, u4, u4, std::string, size_t, u4, u4, float, u4, bool, size_t>(),
+                 py::arg("k") = 15, py::arg("s") = 8, py::arg("t") = 0, py::arg("downsample") = 2,
+                 py::arg("win") = 4000, py::arg("overlap") = 2, py::arg("variant") = "lsm",
+                 py::arg("buffer") = 1 << 20, py::arg("ratio") = 2, py::arg("max_occ") = 0,
+                 py::arg("threshold") = 0.15f, py::arg("check_bp") = 360, py::arg("skip_mapped") = true,
+                 py::arg("chunk") = 32'000'000)
+            .def("add_record", &DynamicIndex::add_record, py::arg("name"), py::arg("seq"),
+                 py::arg("skip_mapped") = py::none(),
+                 "Add a sequence; returns whether it was added. skip_mapped=None uses the index default.")
+            .def("query", &DynamicIndex::query, py::arg("seq"))
+            .def("query_batch", &DynamicIndex::query_batch, py::arg("seqs"))
+            .def("decide", &DynamicIndex::decide, py::arg("seqs"),
+                 "query_batch over each sequence's first check_bp bases")
+            .def("is_mapped", &DynamicIndex::is_mapped, py::arg("result"))
+            .def("query_stream", &DynamicIndex::query_stream, py::arg("reads"))
+            .def("window_locus", &DynamicIndex::window_locus, py::arg("wid"))
+            .def("nbytes", [](const DynamicIndex &d) { return d.ix.nbytes(); })
+            .def_property_readonly("n_records", [](const DynamicIndex &d) { return d.ix.n_records(); })
+            .def_property_readonly("n_windows", [](const DynamicIndex &d) { return d.ix.n_windows(); })
+            .def_property_readonly("n_entries", [](const DynamicIndex &d) { return d.ix.n_entries(); })
+            .def_property_readonly("n_runs", [](const DynamicIndex &d) { return d.ix.n_runs(); })
+            .def_property_readonly("run_sizes", [](const DynamicIndex &d) { return d.ix.run_sizes(); })
+            .def_property_readonly("buffer_size", [](const DynamicIndex &d) { return d.ix.buffer_size(); })
+            .def_property_readonly("n_blocked", [](const DynamicIndex &d) { return d.ix.n_blocked(); })
+            .def_property_readonly("n_flushes", [](const DynamicIndex &d) { return d.ix.n_flushes; })
+            .def_property_readonly("n_merges", [](const DynamicIndex &d) { return d.ix.n_merges; })
+            .def_property_readonly("worst_flush_s", [](const DynamicIndex &d) { return d.ix.worst_flush_s; })
+            .def_property_readonly("threshold", [](const DynamicIndex &d) { return d.ix.dp.threshold; })
+            .def_property_readonly("check_bp", [](const DynamicIndex &d) { return d.ix.dp.check_bp; })
+            .def_property_readonly("p", [](const DynamicIndex &d) { return d.ix.p; })
+            .def("__repr__", &DynamicIndex::repr);
 }
